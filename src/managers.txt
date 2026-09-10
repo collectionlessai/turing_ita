@@ -1,0 +1,2 @@
+hotel,jolly-mayer/HotelManager-TuringHotelItaly
+floor,jolly-mayer/FloorManager-TuringHotelItaly

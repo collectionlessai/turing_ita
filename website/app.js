@@ -1,0 +1,1031 @@
+/* ═══════════════════════════════════════════════════════
+   Hotel delle Imitazioni (Turing Hotel Italia) — single-page app over the MySQL mirror of the world
+   stats DB (via api.php). Pages: #/ overview (KPI + ops chart) · #/floors (floors and rooms, from
+   the votes and the logged conversations) · #/room/<session> (conversation + votes of the room) ·
+   #/users · #/user/<unaid> · #/leaderboard (the SAME leaderboard of the dashboard shown when
+   joining the world: the src/stats.py aggregations are replicated here 1:1 — scopes, K, thresholds
+   and roundings).
+   ═══════════════════════════════════════════════════════ */
+
+const API = window.API_OVERRIDE || "api.php";  // The override serves local tests (see the README)
+const MEDALS = ["\u{1F947}", "\u{1F948}", "\u{1F949}"];
+const MIN_VOTES = 1;             // src/stats.py: _MIN_VOTES
+const K_TURING = 5;              // src/stats.py: _K of the votee (fooling) leaderboard
+const K_DETECTION = 10;          // src/stats.py: _K of the voter (detection) leaderboard
+const SCOPES = { max: 30 * 864e5, "7d": 7 * 864e5, "24h": 864e5 };  // src/stats.py: _SCOPE_WINDOWS_MS
+const PRESENCE_LIVE_MS = 20 * 60e3;  // A room with no activity for this long is idle/stale: its
+                                     // "in the room now" list is hidden (covers the guests seated at
+                                     // a world restart, whose exit events were never written)
+const PRESENCE_MAX_AGE_S = window.PRESENCE_MAX_AGE_S || 320;  // A 'joined' with no exit event after this
+                                     // many seconds is a ghost and is NOT shown as present: conversations
+                                     // last 300s (+20 of safety), so nobody legitimately sits at the round
+                                     // table longer — and with broadcast_when_no_humans off, the exit of
+                                     // a guest in a human-less room is never logged. Overridable without
+                                     // editing this file: set window.PRESENCE_MAX_AGE_S in index.html
+const OPS_STATS = ["hotel_n_floors_active", "hotel_n_rooms_active", "hotel_n_rooms_overbooked",
+                   "hotel_n_agents_present", "hotel_n_agents_waiting"];
+const OPS_PALETTE = ["#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f"];  // src/stats.py: _PALETTE
+
+const L = {
+  site_loading: "Loading the Hotel…",
+  site_error_api: "Could not load the Hotel data (<ERROR>). Is api.php configured?",
+  site_error_generic: "Something went wrong: <ERROR>",
+  site_error_convo: "Could not load the conversation: <ERROR>",
+  site_not_found: "Page not found.",
+  // Stats vocabulary as in src/stats.py (_HOTEL_OPS_LABELS, _SCOPE_LABELS, summary cards, confusion
+  // matrix); leaderboard terms as in the English Turing Hotel renderer (Best Fooling/Detecting, ...)
+  ops_labels: { hotel_n_floors_active: "Floors active", hotel_n_rooms_active: "Rooms active",
+                hotel_n_rooms_overbooked: "Rooms overbooked",
+                hotel_n_agents_present: "Agents in rooms", hotel_n_agents_waiting: "Agents waiting" },
+  card_total_agents: "Total agents", card_active_rooms: "Active rooms", card_active_floors: "Active floors",
+  card_votes: "Votes (<SCOPE>)",
+  scope_labels: { max: "1 month (Max)", "7d": "7 days", "24h": "24 hours" },
+  overview_title: "Overview", overview_chart: "Operational activity over time",
+  floors_title: "Floors and rooms — present and past",
+  floors_note: "Everything the archive knows: the rooms where votes were recorded and the logged " +
+               "conversations. Rooms with recent activity also show who is at their round table " +
+               "right now (as of the last sync of the archive).",
+  floor_label: "Floor", room_label: "Room", rooms_label: "rooms",
+  no_floors: "No recorded activity yet.",
+  room_votes_badge_one: "1 vote", room_votes_badge: "<N> votes",
+  room_msgs_badge_one: "1 message", room_msgs_badge: "<N> messages",
+  room_people_badge_one: "1 participant", room_people_badge: "<N> participants",
+  room_now_badge_one: "1 in the room now", room_now_badge: "<N> in the room now",
+  room_now_title: "In the room now",
+  card_messages: "Messages logged", card_participants: "Participants seen",
+  room_conversation: "Conversation", room_votes: "Votes cast in this room",
+  room_not_logged: "The conversation of this room was not logged.",
+  room_window_note: "Showing only the part of the conversation that <A> and <B> shared " +
+                    "(the context of the vote).",
+  room_window_all: "Show the whole conversation",
+  room_window_fail: "Could not isolate the shared window (events not available): showing the whole " +
+                    "conversation.",
+  room_window_tip: "Open the room, restricted to the conversation window shared by voter and votee",
+  vote_to_event_tip: "Show where this voter left the conversation (the moment that generated the vote)",
+  evt_to_votes_tip: "Show the votes generated by this exit",
+  range_from: "From", range_to: "To", range_apply: "Apply range", range_clear: "Show latest",
+  range_empty: "No messages here.",
+  chat_load_older: "Load older messages", chat_load_more: "Load more messages",
+  vote_cols: { voter: "Voter", nature: "Nature", vote: "Vote", truth: "Truth", outcome: "Outcome",
+               fake_voter: "Voter fake name", fake_votee: "Votee fake name", msg: "Vote message" },
+  users_title: "Users", user_cols: { user: "User", nature: "Nature", cast: "Votes cast",
+                                     received: "Votes received", last: "Last activity" },
+  user_votes_cast: "Votes cast by", user_votes_received: "Votes received by",
+  user_info_btn: "Info", info_none: "This is not registered in any Google Forms.",
+  info_unavailable: "The info sheet could not be loaded.",
+  // The leaderboard labels below are VERBATIM from src/html_renderer.py (the dashboard shown when
+  // joining the world IS this leaderboard: same tabs, columns, podium score labels, nature values)
+  lb_title: "Leaderboard", lb_fooling: "Best Fooling", lb_detecting: "Best Detecting",
+  lb_score_fooling: "Turing Score", lb_score_detecting: "Detection Score",
+  lb_none: "No data (minimum vote threshold not reached).",
+  lb_human_only: "Human votes only",
+  cm_title: "Confusion matrix", cm_corner: "Truth \\ Vote",
+  votee_cols: { peer: "AI Agent", votes: "Votes received", fooling: "Fooling rate %",
+                avg_msgs: "Avg msgs sent", turing: "Turing score" },
+  voter_cols: { peer: "Agent", nature: "Nature", votes: "Votes cast", precision: "Precision %",
+                recall: "Recall %", f1: "F1 %", detection: "Detection score" },
+  nature_human: "human", nature_ai: "ai",  // Raw values, as in the renderer's voter table
+  search_placeholder: "Search…", pg_showing: "Showing", pg_results: () => "results",
+};
+
+/* ─── helpers ──────────────────────────────────────────── */
+const $ = (sel) => document.querySelector(sel);
+const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g,
+  (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const fill = (t, map) => Object.entries(map).reduce((z, [k, v]) => z.split("<" + k + ">").join(String(v)), t);
+const shortId = (unaid) => { const s = String(unaid || ""); const i = s.lastIndexOf("/");
+  return i >= 0 ? s.substring(i + 1) : s; };
+const short8 = (u) => String(u || "").substring(0, 8);
+const round1 = (x) => Math.round(x * 10) / 10;
+const fmtTs = (ts) => ts ? new Date(ts).toLocaleString() : "-";
+const seg = (s) => encodeURIComponent(String(s));
+const unseg = (s) => decodeURIComponent(String(s));
+const natureLabel = (n) => n === "human" ? L.nature_human : (n === "ai" ? L.nature_ai : "-");
+const stripTag = (s) => String(s == null ? "" : s).replace(/^\[[^\]]+\]\s*/, "");  // '[LEFT_MSG] x' -> 'x'
+//                      (all the status messages carry that tag on the wire and in the DB; the agents
+//                       strip it before showing them, and so does this site)
+const GRID_LANG = () => ({ search: { placeholder: L.search_placeholder },
+                           pagination: { previous: "←", next: "→",
+                                         showing: L.pg_showing, results: L.pg_results } });
+
+async function getJSON(url) {
+  const r = await fetch(url, { cache: "no-store" });
+  const body = await r.text();  // Read once: the error detail of api.php (or PHP error text) is in here
+  if (!r.ok) throw new Error(url + " -> HTTP " + r.status + (body ? " — " + body.slice(0, 600) : ""));
+  try {
+    return JSON.parse(body);
+  } catch (e) {
+    throw new Error(url + " -> invalid JSON: " + body.slice(0, 600));
+  }
+}
+
+/* ─── theme engine (same behavior as the dashboard) ────── */
+let _theme = "dark";
+function setTheme(m) {
+  if (m !== "dark" && m !== "light") return;
+  _theme = m;
+  document.documentElement.setAttribute("data-theme", m);
+  drawOpsChart();  // Re-style the Plotly chart, if on page
+}
+function toggleTheme() { setTheme(_theme === "dark" ? "light" : "dark"); }
+window.toggleTheme = toggleTheme;
+try {
+  if (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches) setTheme("light");
+} catch (e) { /* keep dark */ }
+
+/* ─── data ─────────────────────────────────────────────── */
+const DB = { ops: null, votes: [], emptyVotes: [], sessions: [], floors: null, loaded: false, error: null,
+             info: {} };  // info: per-nature sheet data, see loadSheets()
+
+/* ── participant info from the Google Spreadsheets (view-by-link) ──────
+   TWO registration forms feed two sheets, one for AI agents and one for HUMAN agents (similar but
+   not identical structure: same B/C/D/E/F columns (C is the email), F has a different header — each
+   popup line uses the header of ITS OWN sheet). Loaded at startup through the 'gviz' JSON endpoint (works on link-shared
+   sheets, CORS enabled). Row 1 is the header; column D ("UNaIVERSE nickname") is the key of each
+   associative map — the nickname is the part of the UNaID BEFORE the '/' (UNaID = nickname/agent
+   name). An agent is looked up in the sheet of its NATURE (from the votes), falling back to the
+   other sheet; a failure here never blocks the site. */
+const SHEETS = {
+  ai: "1mdIUYWe28xA04qV-nV1KlTQKOrN4CxXCYDfRZ55yo9o",     // AI-agents registration form
+  human: "1a4RQh39XAed-X87JzB8kOk1IQOjqo54PhMSazVAk1nc",  // Human-agents registration form
+};
+const sheetUrl = (kind) => (window.SHEET_URL_OVERRIDES || {})[kind] ||
+  `https://docs.google.com/spreadsheets/d/${SHEETS[kind]}/gviz/tq?tqx=out:json&headers=1`;
+const INFO_KEY_COL = 3;       // Column D
+const INFO_SHOW_COLS = [1, 2, 4, 5];  // Columns B, C (email), E, F
+
+async function loadSheet(kind) {
+  try {
+    const r = await fetch(sheetUrl(kind), { cache: "no-store" });
+    const text = await r.text();  // JSONP-ish: google.visualization.Query.setResponse({...});
+    const data = JSON.parse(text.substring(text.indexOf("(") + 1, text.lastIndexOf(")")));
+    const cell = (row, i) => {
+      const c = (row.c || [])[i];
+      return c == null ? "" : String(c.f != null ? c.f : (c.v != null ? c.v : ""));
+    };
+    const headers = (data.table.cols || []).map((c) => String(c.label || "").trim());
+    const map = new Map();
+    for (const row of (data.table.rows || [])) {
+      const key = cell(row, INFO_KEY_COL).trim();
+      if (key !== "") map.set(key, INFO_SHOW_COLS.map((i) => cell(row, i)));
+    }
+    DB.info[kind] = { map, headers };
+  } catch (e) {
+    DB.info[kind] = null;  // Sheet unreachable/misconfigured: the Info popup will say so
+  }
+}
+
+function loadSheets() {
+  DB.info = {};
+  loadSheet("ai");
+  loadSheet("human");
+}
+
+window.showUserInfo = (unaidSeg) => {
+  const unaid = unseg(unaidSeg);
+  const cut = unaid.lastIndexOf("/");
+  const nickname = cut >= 0 ? unaid.substring(0, cut) : unaid;
+  const u = usersIndex().get(unaid);
+  const nature = u ? u.nature : "-";
+  const order = nature === "human" ? ["human", "ai"] : ["ai", "human"];  // Own-nature sheet first
+  let entry = null;
+  let headers = null;
+  let loadedAny = false;
+  for (const kind of order) {
+    const s = (DB.info || {})[kind];
+    if (!s) continue;
+    loadedAny = true;
+    if (entry === null && s.map.has(nickname)) {
+      entry = s.map.get(nickname);
+      headers = s.headers;
+    }
+  }
+  let body;
+  if (!loadedAny) body = `<p class="empty">${esc(L.info_unavailable)}</p>`;
+  else if (entry === null) body = `<p class="empty">${esc(L.info_none)}</p>`;
+  else body = entry.map((v, j) =>
+    `<div class="info-line"><strong>${esc(headers[INFO_SHOW_COLS[j]] || "?")}:</strong> ` +
+    `${esc(v || "-")}</div>`).join("");
+  const back = document.createElement("div");
+  back.className = "modal-back";
+  back.innerHTML = `<div class="modal panel"><div class="modal-head">` +
+    `<div><h3>${esc(shortId(unaid))}</h3><div class="modal-unaid">${esc(unaid)}</div></div>` +
+    `<button class="ctrl-btn" onclick="this.closest('.modal-back').remove()">✕</button></div>${body}</div>`;
+  back.addEventListener("click", (ev) => { if (ev.target === back) back.remove(); });
+  document.body.appendChild(back);
+};
+
+async function loadAll() {
+  loadSheets();  // In parallel, never blocking: the maps fill as soon as the sheets answer
+  const [ops, votes, sessions, emptyVotes, presence] = await Promise.all([
+    getJSON(API + "?q=ops"), getJSON(API + "?q=votes"), getJSON(API + "?q=sessions"),
+    getJSON(API + "?q=empty_votes"), getJSON(API + "?q=presence")]);
+  DB.ops = ops;
+  DB.votes = votes;  // VALID votes only: everything performance-related aggregates THIS array
+  DB.emptyVotes = emptyVotes;  // Unparsable votes ('reason' inside): DISPLAY-only, never aggregated
+  DB.sessions = sessions;
+
+  // Floors -> rooms, from the votes (session_id = "<floor id>:<room id>") and the logged conversations
+  const floors = new Map();
+  const roomOf = (session) => {
+    const parts = String(session || "").split(":");
+    if (parts.length !== 2) return null;
+    const [fid, rid] = parts;
+    if (!floors.has(fid)) floors.set(fid, new Map());
+    const rooms = floors.get(fid);
+    if (!rooms.has(rid)) rooms.set(rid, { session, votes: [], emptyVotes: [], convo: null, last_ts: 0,
+                                          participants: new Set(), present: [] });
+    return rooms.get(rid);
+  };
+  for (const rec of votes) {
+    const room = roomOf(rec.v && rec.v.session_id);
+    if (room) {
+      room.votes.push(rec);
+      room.last_ts = Math.max(room.last_ts, rec.ts);
+      if (rec.v.voter) room.participants.add(rec.v.voter);
+      if (rec.votee) room.participants.add(rec.votee);
+    }
+  }
+  for (const rec of emptyVotes) {  // Shown in the room's votes table (and presence traces), no more
+    const room = roomOf(rec.v && rec.v.session_id);
+    if (room) {
+      room.emptyVotes.push(rec);
+      if (rec.v.voter) room.participants.add(rec.v.voter);
+    }
+  }
+  for (const s of sessions) {
+    const room = roomOf(s.session);
+    if (room) {
+      room.convo = s;
+      room.last_ts = Math.max(room.last_ts, s.last_ts);
+      for (const a of (s.authors || [])) room.participants.add(a);
+    }
+  }
+  const presenceNow = Date.now();
+  for (const [session, guests] of Object.entries(presence || {})) {
+    const room = roomOf(session);  // Who is at the round table now (see api.php ?q=presence);
+    if (room) {                    // pageFloors only shows it while the room is actually alive
+      room.present = guests.filter((g) => (presenceNow - g.since_ts) <= PRESENCE_MAX_AGE_S * 1000)
+        .sort((a, b) => String(a.fake_name).localeCompare(String(b.fake_name)));
+      for (const g of guests) if (g.author) room.participants.add(g.author);
+    }
+  }
+  DB.floors = floors;
+  DB.loaded = true;
+}
+
+/* ─── aggregations: 1:1 ports of src/stats.py ──────────── */
+function votesInScope(scope) {
+  const now = Date.now();
+  return DB.votes.filter((r) => (now - r.ts) <= SCOPES[scope]);
+}
+
+function aggConfusion(votes) {  // WStats._compute_confusion_matrix
+  const counts = { human: { human: 0, ai: 0 }, ai: { human: 0, ai: 0 } };
+  for (const rec of votes) {
+    const gt = rec.v.ground_truth, vt = rec.v.vote;
+    if (counts[gt] && (vt === "human" || vt === "ai")) counts[gt][vt] += 1;
+  }
+  const pct = { human: { human: 0, ai: 0 }, ai: { human: 0, ai: 0 } };
+  for (const gt of ["human", "ai"]) {
+    const tot = counts[gt].human + counts[gt].ai;
+    for (const vt of ["human", "ai"]) pct[gt][vt] = tot ? counts[gt][vt] / tot * 100 : 0;
+  }
+  return { counts, pct };
+}
+
+function aggVotee(votes) {  // WStats._compute_votee_leaderboard (AI-only, Turing score)
+  const by = new Map();
+  for (const rec of votes) {
+    const vid = rec.votee || "", gt = rec.v.ground_truth;
+    if (!vid || gt !== "ai") continue;
+    if (!by.has(vid)) by.set(vid, { votes: 0, fooling: 0, msgs_total: 0 });
+    const e = by.get(vid);
+    e.votes += 1;
+    if (rec.v.vote && rec.v.vote !== gt) e.fooling += 1;
+    e.msgs_total += Number(rec.v.msgs_from_votee) || 0;
+  }
+  const rows = [];
+  for (const [vid, e] of by) {
+    if (e.votes < MIN_VOTES) continue;
+    const fooling_rate = e.fooling / e.votes * 100;
+    const avg_msgs = e.msgs_total / e.votes;
+    rows.push({ peer_id: vid, votes: e.votes, fooling_rate: round1(fooling_rate),
+                avg_msgs: round1(avg_msgs),
+                turing_score: round1(fooling_rate * avg_msgs / (avg_msgs + K_TURING)) });
+  }
+  rows.sort((a, b) => b.turing_score - a.turing_score);
+  return rows;
+}
+
+function aggVoter(votes) {  // WStats._compute_voter_leaderboard (positive class = human)
+  const nature = new Map();
+  for (const rec of votes) {
+    const v = rec.v.voter, n = rec.v.voter_nature;
+    if (v && (n === "human" || n === "ai")) nature.set(v, n);
+  }
+  const by = new Map();
+  for (const rec of votes) {
+    const vid = rec.v.voter || "";
+    if (!vid) continue;
+    if (!by.has(vid)) by.set(vid, { total: 0, tp: 0, fp: 0, tn: 0, fn: 0 });
+    const e = by.get(vid);
+    e.total += 1;
+    const gt = rec.v.ground_truth, vt = rec.v.vote;
+    if (vt !== "human" && vt !== "ai") continue;
+    if (gt === "human" && vt === "human") e.tp += 1;
+    else if (gt === "ai" && vt === "human") e.fp += 1;
+    else if (gt === "ai" && vt === "ai") e.tn += 1;
+    else if (gt === "human" && vt === "ai") e.fn += 1;
+  }
+  const fmt = (v) => v == null ? null : (v * 100).toFixed(1);
+  const rows = [];
+  for (const [vid, e] of by) {
+    if (e.total < MIN_VOTES) continue;
+    const prec = (e.tp + e.fp) ? e.tp / (e.tp + e.fp) : null;
+    const rec_ = (e.tp + e.fn) ? e.tp / (e.tp + e.fn) : null;
+    const f1 = (prec != null && rec_ != null && (prec + rec_) > 0)
+      ? 2 * prec * rec_ / (prec + rec_) : null;
+    const raw = f1 != null ? f1 * e.total / (e.total + K_DETECTION) : null;
+    rows.push({ peer_id: vid, nature: nature.get(vid) || "-", votes: e.total,
+                precision: fmt(prec), recall: fmt(rec_), f1: fmt(f1),
+                detection_score: raw != null ? round1(raw * 100) : null,
+                _sort: raw != null ? raw : -1 });
+  }
+  rows.sort((a, b) => b._sort - a._sort);
+  return rows;
+}
+
+/* ─── shared fragments ─────────────────────────────────── */
+const peerLink = (unaid) => `<a class="peer-cell" href="#/user/${seg(unaid)}" ` +
+  `title="${esc(unaid)}">${esc(shortId(unaid))}</a>`;
+
+function kpiCards() {
+  const latest = (stat) => { const pts = (DB.ops.series || {})[stat] || [];
+    return pts.length ? pts[pts.length - 1][1] : 0; };
+  const messages = DB.sessions.reduce((tot, s) => tot + s.n, 0);
+  const participants = new Set();
+  for (const rec of DB.votes) {
+    if (rec.v.voter) participants.add(rec.v.voter);
+    if (rec.votee) participants.add(rec.votee);
+  }
+  for (const s of DB.sessions) for (const a of (s.authors || [])) participants.add(a);
+  const cards = [
+    [L.card_total_agents, DB.ops.n_total_agents == null ? 0 : DB.ops.n_total_agents],
+    [L.card_active_rooms, latest("hotel_n_rooms_active")],
+    [L.card_active_floors, latest("hotel_n_floors_active")],
+    [fill(L.card_votes, { SCOPE: L.scope_labels[STATE.scope] }), votesInScope(STATE.scope).length],
+    [L.card_messages, messages],
+    [L.card_participants, participants.size],
+  ];
+  return '<div class="summary-bar">' + cards.map(([lbl, val]) =>
+    `<div class="card"><span class="card-val">${esc(val)}</span>` +
+    `<span class="card-lbl">${esc(lbl)}</span></div>`).join("") + "</div>";
+}
+
+/* ─── pages ────────────────────────────────────────────── */
+const STATE = { scope: "max", lb: "fooling", userTab: "cast", humanOnly: false };
+
+function pageOverview() {
+  return kpiCards() +
+    `<div class="panel"><h3>${esc(L.overview_chart)}</h3>` +
+    `<div id="chart-ops" style="height:320px"></div></div>`;
+}
+
+function drawOpsChart() {
+  const el = document.getElementById("chart-ops");
+  if (!el || !window.Plotly || !DB.ops) return;
+  const css = getComputedStyle(document.documentElement);
+  const traces = OPS_STATS.map((stat, i) => {
+    const pts = (DB.ops.series || {})[stat] || [];
+    return { x: pts.map(([ts]) => new Date(ts)), y: pts.map(([, v]) => v),
+             name: L.ops_labels[stat], type: "scatter", mode: "lines",
+             line: { color: OPS_PALETTE[i], width: 2, shape: "hv" } };
+  }).filter((t) => t.x.length > 0);
+  Plotly.react(el, traces, {
+    margin: { l: 40, r: 10, t: 10, b: 40 },
+    paper_bgcolor: "rgba(0,0,0,0)", plot_bgcolor: "rgba(0,0,0,0)",
+    font: { color: css.getPropertyValue("--text-secondary").trim() || "#888", size: 11 },
+    xaxis: { gridcolor: css.getPropertyValue("--border").trim() },
+    yaxis: { gridcolor: css.getPropertyValue("--border").trim(), rangemode: "tozero" },
+    legend: { orientation: "h", y: -0.2 },
+  }, { displayModeBar: false, responsive: true });
+}
+
+function pageFloors() {
+  if (DB.floors.size === 0) return `<p class="empty">${esc(L.no_floors)}</p>`;
+  let html = `<h2 class="section-title">${esc(L.floors_title)}</h2>` +
+             `<p class="section-note">${esc(L.floors_note)}</p>`;
+  const floors = [...DB.floors.entries()].sort((a, b) => {
+    const last = (rooms) => Math.max(...[...rooms.values()].map((r) => r.last_ts));
+    return last(b[1]) - last(a[1]);
+  });
+  for (const [fid, rooms] of floors) {
+    const roomCards = [...rooms.entries()].sort((a, b) => b[1].last_ts - a[1].last_ts).map(([rid, r]) => {
+      const badge = (n, one, many, cls) => n > 0 &&
+        `<span class="badge ${cls}">${esc(n === 1 ? one : fill(many, { N: n }))}</span>`;
+      // The current occupants come from the event replay (api.php ?q=presence): shown only while
+      // the room is alive (recent activity), because the guests seated at a world RESTART never got
+      // their exit event — their old-run sessions go quiet and this hides them (see PRESENCE_LIVE_MS)
+      const alive = r.present.length > 0 && (Date.now() - r.last_ts) <= PRESENCE_LIVE_MS;
+      const badges = [
+        badge(alive ? r.present.length : 0, L.room_now_badge_one, L.room_now_badge, "badge-yes"),
+        badge(r.votes.length, L.room_votes_badge_one, L.room_votes_badge, "badge-past"),
+        badge(r.convo ? r.convo.n : 0, L.room_msgs_badge_one, L.room_msgs_badge, "badge-live"),
+        badge(r.participants.size, L.room_people_badge_one, L.room_people_badge, "badge-open"),
+      ].filter(Boolean);
+      const present = !alive ? "" :
+        `<div class="room-present"><div class="room-present-title">${esc(L.room_now_title)}</div>` +
+        r.present.map((g) =>
+          `<div class="present-row"><b>${esc(g.fake_name || "?")}</b>` +
+          `<span class="badge ${g.nature === "human" ? "badge-open" :
+                                (g.nature === "ai" ? "badge-sched" : "badge-none")}">` +
+          `${esc(natureLabel(g.nature))}</span>` +
+          `<span class="present-id" title="${esc(g.author)}">${esc(g.author)}</span></div>`).join("") +
+        `</div>`;
+      return `<a class="circle-card" href="#/room/${seg(r.session)}">` +
+        `<div class="circle-head"><span class="circle-code">${esc(short8(rid))}</span>` +
+        `<span class="circle-occ">${esc(fmtTs(r.last_ts))}</span></div>` +
+        `<div class="circle-name">${esc(L.room_label)} ${esc(short8(rid))}</div>` +
+        `<div class="circle-topics">${badges.join(" ")}</div>${present}</a>`;
+    }).join("");
+    html += `<div class="sector-card"><div class="sector-head">` +
+      `<h3>${esc(L.floor_label)} ${esc(short8(fid))}</h3>` +
+      `<span class="sector-slots">${rooms.size} ${rooms.size === 1 ? esc(L.room_label.toLowerCase()) : esc(L.rooms_label)}</span>` +
+      `</div><div class="circle-grid">${roomCards}</div></div>`;
+  }
+  return html;
+}
+
+function pairWindows(events, a, aFake, b, bFake) {
+  // ALL the [fromId, toId|null, endTs] windows in which the two given identities were in the room
+  // TOGETHER, computed over the EVENT stream only (?q=events — transcripts are unbounded, the chat
+  // rows are fetched later by id range): from the join that completes the pair to the first
+  // left/disconnected of either (both boundary events included). Rooms are REUSED, so an identity is
+  // the PAIR unaid + fake name (matching by unaid alone can hit the wrong session); a null/unknown
+  // fake name matches any alias. A window still open at the end has toId null and endTs Infinity.
+  const match = (m, unaid, fake) => m.author === unaid &&
+    (!fake || !m.author_fake_name || m.author_fake_name === fake);
+  const present = { a: false, b: false };
+  const windows = [];
+  let startId = null;
+  for (const ev of events) {
+    const m = ev.m || {};
+    const who = match(m, a, aFake) ? "a" : (match(m, b, bFake) ? "b" : null);
+    if (who === null) continue;
+    if (m.event === "joined") {
+      present[who] = true;
+      if (startId === null && present.a && present.b) startId = ev.id;
+    } else {  // left / disconnected
+      if (startId !== null) windows.push([startId, ev.id, m.ts || ev.ts || 0]);
+      startId = null;
+      present[who] = false;
+    }
+  }
+  if (startId !== null) windows.push([startId, null, Infinity]);  // Still open
+  return windows;
+}
+
+function pickWindow(windows, voteTs) {
+  // The window of THE vote: the one whose RIGHT extreme is closest to the vote time without passing
+  // it (the voter leaves the room, then votes: the window always closes right before the vote).
+  // Without a vote time, or when the clocks disagree, fall back to the closest window after it.
+  if (windows.length === 0) return null;
+  if (!voteTs) return windows[0];
+  let best = null;
+  for (const w of windows) {
+    if (w[2] <= voteTs && (best === null || w[2] > best[2])) best = w;
+  }
+  if (best === null) {
+    for (const w of windows) {
+      if (best === null || w[2] < best[2]) best = w;
+    }
+  }
+  return best;
+}
+
+const ROOM = {};  // State of the room page in view (rows, pagination cursors, mode, time range)
+
+async function fetchConvo(params) {
+  const qs = Object.entries(params).filter(([, v]) => v !== null && v !== undefined && v !== "")
+    .map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join("&");
+  return getJSON(API + "?q=conversation&" + qs);
+}
+
+function buildChat(rows) {
+  const hues = {};  // Author -> hue by order of first appearance (golden-angle: far-apart colors)
+  const hueOf = (name) => {
+    const k = String(name || "?");
+    if (!(k in hues)) hues[k] = Math.round(210 + Object.keys(hues).length * 137.508) % 360;
+    return hues[k];
+  };
+  return '<div class="chat">' + rows.map((ch) => {
+    const m = ch.m || {};
+    if (m.kind === "event") {  // Joined/left/disconnected: a centered system line, not a bubble
+      const arrow = (m.event === "left" || m.event === "disconnected")
+        ? ` <button class="evt-arrow" onclick="eventToVotes(${ch.id})" ` +
+          `title="${esc(L.evt_to_votes_tip)}">➡️</button>` : "";
+      return `<div class="msg-event" id="chunk-${ch.id}" ` +
+        `title="${esc(fmtTs(m.ts || ch.ts))}">${esc(stripTag(m.text))}${arrow}</div>`;
+    }
+    return `<div class="msg" id="chunk-${ch.id}"><div class="msg-author" ` +
+      `style="color:hsl(${hueOf(m.author_fake_name)} 60% var(--author-l))">` +
+      `${esc(m.author_fake_name || "?")}` +
+      (m.author ? `<a class="msg-unaid" href="#/user/${seg(m.author)}">${esc(m.author)}</a>` : "") +
+      `</div>` +
+      `<div class="msg-text">${esc(m.text || "")}</div>` +
+      `<div class="msg-time">${fmtTs(m.ts || ch.ts)}</div></div>`;
+  }).join("") + "</div>";
+}
+
+function renderChatArea() {
+  // Room transcripts are unbounded: the chat area shows one PAGE (latest / time range / vote window)
+  // with its continuation button, plus the time-range controls
+  const toLocal = (ts) => {  // ms -> datetime-local value, in the browser's timezone
+    if (!ts) return "";
+    const d = new Date(ts - new Date(ts).getTimezoneOffset() * 60000);
+    return d.toISOString().slice(0, 19);  // With seconds (step="1")
+  };
+  const controls = `<div class="range-bar">` +
+    `<label>${esc(L.range_from)}</label><input type="datetime-local" step="1" id="range-from" ` +
+    `value="${toLocal(ROOM.from_ts)}">` +
+    `<label>${esc(L.range_to)}</label><input type="datetime-local" step="1" id="range-to" ` +
+    `value="${toLocal(ROOM.to_ts)}">` +
+    `<button class="ctrl-btn" onclick="roomApplyRange()">${esc(L.range_apply)}</button>` +
+    (ROOM.mode !== "latest"
+      ? `<button class="ctrl-btn" onclick="roomClearRange()">${esc(L.range_clear)}</button>` : "") +
+    `</div>`;
+  const older = ROOM.moreOlder
+    ? `<button class="ctrl-btn chat-more" onclick="roomLoadOlder()">${esc(L.chat_load_older)}</button>` : "";
+  const newer = ROOM.moreNewer
+    ? `<button class="ctrl-btn chat-more" onclick="roomLoadMore()">${esc(L.chat_load_more)}</button>` : "";
+  const chat = ROOM.rows.length === 0 ? `<p class="empty">${esc(L.range_empty)}</p>` : buildChat(ROOM.rows);
+  return ROOM.note + controls + older + chat + newer;
+}
+
+function repaintChat(e) {
+  const el = document.getElementById("chat-area");
+  if (!el) return;
+  el.innerHTML = e ? `<div class="error-banner">${esc(fill(L.site_error_convo, { ERROR: e.message }))}</div>`
+                   : renderChatArea();
+}
+
+const chatEl = () => document.querySelector("#chat-area .chat");
+
+/* ── vote <-> departure-event cross links (the arrows in the votes table and on the event lines) ── */
+const identityMatch = (unaidA, fakeA, unaidB, fakeB) =>
+  unaidA === unaidB && (!fakeA || !fakeB || fakeA === fakeB);
+
+function flash(el) {
+  if (!el) return;
+  el.classList.remove("flash");
+  void el.offsetWidth;  // Restart the CSS animation
+  el.classList.add("flash");
+}
+
+function scrollToIn(container, el, margin = 60) {
+  if (!container || !el) return;
+  container.scrollTop += el.getBoundingClientRect().top - container.getBoundingClientRect().top - margin;
+  const panel = container.closest(".panel");
+  if (panel) panel.scrollIntoView({ block: "nearest" });  // On stacked layouts, bring the panel in view
+}
+
+async function roomEvents() {
+  if (!ROOM.events) ROOM.events = await getJSON(API + "?q=events&session=" + seg(ROOM.session));
+  return ROOM.events;
+}
+
+window.voteToEvent = async (voteId) => {
+  // From a vote row to the [LEFT_MSG]/[DISCO_MSG] of its voter that GENERATED it (the voter leaves
+  // the room, then votes): the departure of that identity closest before the vote time
+  try {
+    const rec = (ROOM.votes || []).find((r) => r.id === voteId);
+    if (!rec) return;
+    const events = await roomEvents();
+    const mine = events.filter((e) => (e.m || {}).event !== "joined" &&
+      identityMatch((e.m || {}).author, (e.m || {}).author_fake_name,
+                    rec.v.voter, rec.v.voter_fake_name));
+    let ev = null;
+    for (const e of mine) {  // Closest departure at or before the vote...
+      if ((e.m.ts || e.ts) <= rec.ts && (ev === null || (e.m.ts || e.ts) > (ev.m.ts || ev.ts))) ev = e;
+    }
+    if (ev === null) {  // ...or, with skewed clocks, the closest one after
+      for (const e of mine) {
+        if (ev === null || (e.m.ts || e.ts) < (ev.m.ts || ev.ts)) ev = e;
+      }
+    }
+    if (ev === null) return;
+    if (!ROOM.rows.some((r) => r.id === ev.id)) {  // Not on screen: focus a page around the event
+      const before = await fetchConvo({ session: ROOM.session, before_id: ev.id, limit: 150 });
+      const after = await fetchConvo({ session: ROOM.session, from_id: ev.id, limit: 100 });
+      ROOM.mode = "focus";
+      ROOM.note = "";
+      ROOM.rows = before.rows.concat(after.rows);
+      ROOM.moreOlder = before.more;
+      ROOM.moreNewer = after.more;
+      repaintChat();
+    }
+    const el = document.getElementById("chunk-" + ev.id);
+    scrollToIn(chatEl(), el);
+    flash(el);
+  } catch (e) { repaintChat(e); }
+};
+
+window.eventToVotes = (chunkId) => {
+  // From a departure event to the votes it generated: the votes of that identity closest after the
+  // event (the flattened rows of one voting act land milliseconds apart: flash the whole burst)
+  const row = ROOM.rows.find((r) => r.id === chunkId);
+  if (!row) return;
+  const m = row.m || {};
+  const cand = (ROOM.votes || []).filter((r) =>
+    identityMatch(r.v.voter, r.v.voter_fake_name, m.author, m.author_fake_name) &&
+    r.ts >= (m.ts || row.ts));
+  if (cand.length === 0) return;
+  const first = cand.reduce((z, r) => (r.ts < z.ts ? r : z), cand[0]);
+  const burst = cand.filter((r) => r.ts - first.ts <= 10000);
+  const rowEl = document.getElementById("vote-row-" + first.id);
+  scrollToIn(document.querySelector(".votes-scroll"), rowEl);
+  burst.forEach((r) => flash(document.getElementById("vote-row-" + r.id)));
+};
+
+function scrollChatBottom() {  // The LAST message must be on screen when the conversation appears
+  const el = chatEl();
+  if (el) el.scrollTop = el.scrollHeight;
+}
+
+window.roomLoadOlder = async () => {
+  try {
+    const el0 = chatEl();  // Keep the reader anchored on the message they were looking at
+    const prevTop = el0 ? el0.scrollTop : 0;
+    const prevHeight = el0 ? el0.scrollHeight : 0;
+    const r = await fetchConvo({ session: ROOM.session, limit: 300,
+                                 before_id: ROOM.rows.length ? ROOM.rows[0].id : "" });
+    ROOM.rows = r.rows.concat(ROOM.rows);
+    ROOM.moreOlder = r.more;
+    repaintChat();
+    const el1 = chatEl();
+    if (el1) el1.scrollTop = el1.scrollHeight - prevHeight + prevTop;
+  } catch (e) { repaintChat(e); }
+};
+
+window.roomLoadMore = async () => {
+  try {
+    const prevTop = chatEl() ? chatEl().scrollTop : 0;  // Appending: keep the current position
+    const p = { session: ROOM.session, limit: 300,
+                after_id: ROOM.rows.length ? ROOM.rows[ROOM.rows.length - 1].id : 0 };
+    if (ROOM.mode === "range" && ROOM.to_ts) p.to_ts = ROOM.to_ts;
+    if (ROOM.mode === "window" && ROOM.windowTo != null) p.to_id = ROOM.windowTo;
+    const r = await fetchConvo(p);
+    ROOM.rows = ROOM.rows.concat(r.rows);
+    ROOM.moreNewer = r.more;
+    repaintChat();
+    if (chatEl()) chatEl().scrollTop = prevTop;
+  } catch (e) { repaintChat(e); }
+};
+
+window.roomApplyRange = async () => {
+  try {
+    const f = document.getElementById("range-from").value;
+    const t = document.getElementById("range-to").value;
+    ROOM.from_ts = f ? new Date(f).getTime() : null;
+    ROOM.to_ts = t ? new Date(t).getTime() : null;
+    ROOM.mode = "range";
+    ROOM.note = "";
+    const p = { session: ROOM.session, limit: 300, from_ts: ROOM.from_ts || 0 };  // 0 -> ascending
+    if (ROOM.to_ts) p.to_ts = ROOM.to_ts;
+    const r = await fetchConvo(p);
+    ROOM.rows = r.rows;
+    ROOM.moreNewer = r.more;
+    ROOM.moreOlder = false;
+    repaintChat();
+  } catch (e) { repaintChat(e); }
+};
+
+window.roomClearRange = async () => {
+  try {
+    ROOM.mode = "latest";
+    ROOM.from_ts = ROOM.to_ts = null;
+    ROOM.note = "";
+    const r = await fetchConvo({ session: ROOM.session, limit: 300 });
+    ROOM.rows = r.rows;
+    ROOM.moreOlder = r.more;
+    ROOM.moreNewer = false;
+    repaintChat();
+    scrollChatBottom();  // Back to the 'latest' view: land on the last message
+  } catch (e) { repaintChat(e); }
+};
+
+async function pageRoom(session, pairA, pairB, fakeA, fakeB, voteTs) {
+  const parts = String(session).split(":");
+  const [fid, rid] = parts.length === 2 ? parts : ["?", session];
+  const rooms = DB.floors.get(fid);
+  const room = rooms ? rooms.get(rid) : null;
+
+  Object.assign(ROOM, { session, rows: [], moreOlder: false, moreNewer: false, mode: "latest",
+                        note: "", from_ts: null, to_ts: null, windowTo: null });
+  let convo = `<p class="empty">${esc(L.room_not_logged)}</p>`;
+  if (room && room.convo) {
+    try {
+      if (pairA && pairB) {  // Vote context: only the window the two identities shared, the one that
+        // closed right before the vote (computed over the cheap event stream, then fetched by id range)
+        const events = await getJSON(API + "?q=events&session=" + seg(session));
+        const w = pickWindow(pairWindows(events, pairA, fakeA, pairB, fakeB), voteTs);
+        const allLink = `<a href="#/room/${seg(session)}">${esc(L.room_window_all)}</a>`;
+        if (w !== null) {
+          ROOM.mode = "window";
+          ROOM.windowTo = w[1];
+          const p = { session, limit: 1000, from_id: w[0] };
+          if (w[1] != null) p.to_id = w[1];
+          const r = await fetchConvo(p);
+          ROOM.rows = r.rows;
+          ROOM.moreNewer = r.more;
+          const who = (unaid, fake) => shortId(unaid) + (fake ? ` (${fake})` : "");
+          ROOM.note = `<p class="section-note">` +
+            esc(fill(L.room_window_note, { A: who(pairA, fakeA), B: who(pairB, fakeB) })) +
+            ` ${allLink}</p>`;
+        } else {
+          ROOM.note = `<p class="section-note">${esc(L.room_window_fail)} ${allLink}</p>`;
+        }
+      }
+      if (ROOM.mode === "latest") {
+        const r = await fetchConvo({ session, limit: 300 });
+        ROOM.rows = r.rows;
+        ROOM.moreOlder = r.more;
+      }
+      convo = renderChatArea();
+      // The page HTML is injected by route() right after this returns: scroll then (latest mode
+      // lands on the LAST message; range/window modes read forward from their start)
+      setTimeout(() => { if (ROOM.mode === "latest") scrollChatBottom(); }, 0);
+    } catch (e) {
+      convo = `<div class="error-banner">${esc(fill(L.site_error_convo, { ERROR: e.message }))}</div>`;
+    }
+  }
+
+  // Valid and EMPTY votes are shown together, in time order; the empty ones (unparsable, see their
+  // 'reason') exist only here and in the counts-in-brackets: no aggregation ever sees them
+  const votes = room ? room.votes.concat(room.emptyVotes).sort((a, b) => a.ts - b.ts) : [];
+  ROOM.votes = votes;  // Used by the vote <-> departure-event cross links
+  const voteRows = votes.map((rec) => {
+    const ok = rec.v.vote === rec.v.ground_truth;
+    const voteCell = rec.empty ? `empty (${rec.v.reason || "?"})` : rec.v.vote;
+    const outCell = rec.empty ? `<span class="out-empty">∅</span>`
+      : `<span class="${ok ? "out-ok" : "out-ko"}">${ok ? "✓" : "✗"}</span>`;
+    return `<tr id="vote-row-${rec.id}">` +
+      `<td class="arrow-col"><button class="evt-arrow" onclick="voteToEvent(${rec.id})" ` +
+      `title="${esc(L.vote_to_event_tip)}">⬅️</button></td>` +
+      `<td class="user-col">${peerLink(rec.v.voter)}</td><td>${esc(natureLabel(rec.v.voter_nature))}</td>` +
+      `<td>${esc(rec.v.voter_fake_name || "-")}</td>` +
+      `<td>${esc(rec.v.votee_fake_name || "-")}</td>` +
+      `<td>${esc(voteCell)}</td><td>${esc(rec.v.ground_truth)}</td>` +
+      `<td>${outCell}</td>` +
+      `<td class="vote-msg" title="${esc(rec.v.VOTE_MSG || "")}">${esc(rec.v.VOTE_MSG || "-")}</td>` +
+      `<td>${esc(fmtTs(rec.ts))}</td></tr>`;
+  }).join("");
+  const votesHtml = votes.length === 0 ? `<p class="empty">-</p>` :
+    `<div class="votes-scroll"><table class="cm-table vote-table"><thead><tr><th class="arrow-col"></th>` +
+    `<th class="user-col">${esc(L.vote_cols.voter)}</th>` +
+    `<th>${esc(L.vote_cols.nature)}</th><th>${esc(L.vote_cols.fake_voter)}</th>` +
+    `<th>${esc(L.vote_cols.fake_votee)}</th>` +
+    `<th>${esc(L.vote_cols.vote)}</th>` +
+    `<th>${esc(L.vote_cols.truth)}</th><th>${esc(L.vote_cols.outcome)}</th>` +
+    `<th>${esc(L.vote_cols.msg)}</th><th></th></tr></thead>` +
+    `<tbody>${voteRows}</tbody></table></div>`;
+
+  return `<div class="crumbs"><a href="#/floors">${esc(L.floors_title)}</a> / ` +
+    `${esc(L.floor_label)} ${esc(short8(fid))} / ${esc(L.room_label)} ${esc(short8(rid))}</div>` +
+    `<div class="panel"><h3>${esc(L.room_conversation)}</h3>` +
+    `<div id="chat-area">${convo}</div></div>` +
+    `<div class="panel" style="margin-top:14px"><h3>${esc(L.room_votes)}</h3>${votesHtml}</div>`;
+}
+
+function usersIndex() {
+  const users = new Map();  // unaid -> {nature, cast, emptyCast, received, last_ts}
+  const touch = (unaid) => {
+    if (!unaid) return null;
+    if (!users.has(unaid)) users.set(unaid, { nature: "-", cast: 0, emptyCast: 0, received: 0,
+                                              last_ts: 0 });
+    return users.get(unaid);
+  };
+  for (const rec of DB.votes) {
+    const voter = touch(rec.v.voter);
+    if (voter) { voter.cast += 1; voter.last_ts = Math.max(voter.last_ts, rec.ts);
+      if (rec.v.voter_nature) voter.nature = rec.v.voter_nature; }
+    const votee = touch(rec.votee);
+    if (votee) { votee.received += 1; votee.last_ts = Math.max(votee.last_ts, rec.ts);
+      if (rec.v.ground_truth) votee.nature = rec.v.ground_truth; }
+  }
+  for (const rec of DB.emptyVotes) {  // Only the bracketed counter: never part of any score
+    const voter = touch(rec.v.voter);
+    if (voter) { voter.emptyCast += 1; voter.last_ts = Math.max(voter.last_ts, rec.ts);
+      if (rec.v.voter_nature) voter.nature = rec.v.voter_nature; }
+  }
+  return users;
+}
+
+// '48 (3)' = 48 valid votes cast plus 3 empty (unparsable) ones; no brackets when no empty votes
+const fmtCast = (valid, empty) => empty > 0 ? `${valid} (${empty})` : `${valid}`;
+
+function pageUsers() {
+  const data = [...usersIndex().entries()].map(([unaid, u]) =>
+    [unaid, natureLabel(u.nature), fmtCast(u.cast, u.emptyCast), u.received, u.last_ts]);
+  setTimeout(() => {
+    const el = document.getElementById("users-grid");
+    if (!el) return;
+    new gridjs.Grid({
+      columns: [{ name: L.user_cols.user, formatter: (c) => gridjs.html(peerLink(c)) },
+                L.user_cols.nature, L.user_cols.cast, L.user_cols.received,
+                { name: L.user_cols.last, formatter: (c) => fmtTs(c) }],
+      data, search: true, sort: true, pagination: { limit: 20 }, language: GRID_LANG(),
+    }).render(el);
+  }, 0);
+  return `<h2 class="section-title">${esc(L.users_title)}</h2><div id="users-grid"></div>`;
+}
+
+function pageUser(unaid) {
+  // 'Votes cast' also SHOWS the empty (unparsable) ones, in time order; the confusion matrix and
+  // every count-that-scores stay on the valid votes only
+  const castValid = DB.votes.filter((r) => r.v.voter === unaid);
+  const cast = castValid.concat(DB.emptyVotes.filter((r) => r.v.voter === unaid))
+    .sort((a, b) => a.ts - b.ts);
+  const received = DB.votes.filter((r) => r.votee === unaid);
+  const u = usersIndex().get(unaid);
+  const row = (rec, other) => `<tr><td class="user-col">${peerLink(other)}</td>` +
+    `<td>${esc(rec.v.voter_fake_name || "-")}</td>` +
+    `<td>${esc(rec.v.votee_fake_name || "-")}</td>` +
+    `<td>${esc(rec.empty ? `empty (${rec.v.reason || "?"})` : rec.v.vote)}</td>` +
+    `<td>${esc(rec.v.ground_truth)}</td>` +
+    (rec.empty ? `<td><span class="out-empty">∅</span></td>`
+               : `<td><span class="${rec.v.vote === rec.v.ground_truth ? "out-ok" : "out-ko"}">` +
+                 `${rec.v.vote === rec.v.ground_truth ? "✓" : "✗"}</span></td>`) +
+    `<td class="vote-msg" title="${esc(rec.v.VOTE_MSG || "")}">${esc(rec.v.VOTE_MSG || "-")}</td>` +
+    `<td><a href="#/room/${seg(rec.v.session_id)}?a=${seg(rec.v.voter)}&b=${seg(rec.votee)}` +
+    `&af=${seg(rec.v.voter_fake_name || "")}&bf=${seg(rec.v.votee_fake_name || "")}&t=${rec.ts}" ` +
+    `title="${esc(L.room_window_tip)}">${esc(short8(rec.v.session_id.split(":")[1] || ""))}</a></td>` +
+    `<td>${esc(fmtTs(rec.ts))}</td></tr>`;
+  const table = (rows) => rows.length === 0 ? `<p class="empty">-</p>` :
+    `<div class="table-scroll"><table class="cm-table vote-table">` +
+    `<thead><tr><th class="user-col">${esc(L.user_cols.user)}</th>` +
+    `<th>${esc(L.vote_cols.fake_voter)}</th><th>${esc(L.vote_cols.fake_votee)}</th>` +
+    `<th>${esc(L.vote_cols.vote)}</th><th>${esc(L.vote_cols.truth)}</th>` +
+    `<th>${esc(L.vote_cols.outcome)}</th><th>${esc(L.vote_cols.msg)}</th>` +
+    `<th>${esc(L.room_label)}</th><th></th></tr></thead>` +
+    `<tbody>${rows.join("")}</tbody></table></div>`;
+  // Per-user confusion matrix: the SAME matrix of the leaderboard, restricted to the shown votes —
+  // under 'cast' the outcomes of the classifications THEY made, under 'received' how the other
+  // participants classified THEM. Same presentation of the Leaderboard one: its own panel, in a
+  // half-width column (the empty sibling keeps it narrower than the table above)
+  const miniCm = (votes) => votes.length === 0 ? "" :
+    `<div class="two-col" style="margin-top:18px"><div class="panel"><h3>${esc(L.cm_title)}</h3>` +
+    cmTable(aggConfusion(votes)) + `</div><div></div></div>`;
+
+  // One table at a time (Votes cast / Votes received), switched like the leaderboard tabs
+  const isCast = STATE.userTab !== "received";
+  const votes = isCast ? cast : received;
+  const btns = [["cast", L.user_cols.cast], ["received", L.user_cols.received]].map(([k, lbl]) =>
+    `<button class="ctrl-btn${k === (isCast ? "cast" : "received") ? " active" : ""}" ` +
+    `onclick="setUserTab('${k}')">${esc(lbl)}</button>`).join("") +
+    `<button class="ctrl-btn" onclick="showUserInfo('${seg(unaid)}')">${esc(L.user_info_btn)}</button>`;
+  return `<div class="user-header"><div class="user-avatar">${esc(shortId(unaid).substring(0, 2).toUpperCase())}</div>` +
+    `<div><h2>${esc(shortId(unaid))}</h2><div class="user-unaid">${esc(unaid)}` +
+    `${u ? " · " + esc(natureLabel(u.nature)) : ""}</div></div></div>` +
+    `<div class="ctrl-bar">${btns}</div>` +
+    `<div class="panel"><h3>${esc(isCast ? L.user_votes_cast : L.user_votes_received)} ` +
+    `${esc(shortId(unaid))}</h3>` +
+    table(votes.map((r) => row(r, isCast ? r.votee : r.v.voter))) + `</div>` +
+    miniCm(isCast ? castValid : received);  // The matrix scores VALID votes only
+}
+window.setUserTab = (k) => { STATE.userTab = k; route(); };
+
+/* ─── leaderboard (same as the world dashboard) ────────── */
+function cmTable(cm) {
+  // Translucent accent (same formula of the join dashboard): the intensity rides on the ALPHA
+  // channel, so the tint composites over the theme background (light AND dark)
+  const bg = (p) => `rgba(26,92,255,${(p / 100 * 0.55).toFixed(3)})`;
+  let html = `<table class="cm-table cm-colored"><thead><tr><th>${esc(L.cm_corner)}</th>` +
+    `<th>human</th><th>ai</th></tr></thead><tbody>`;
+  for (const gt of ["human", "ai"]) {
+    html += `<tr><td><strong>${gt}</strong></td>`;
+    for (const vt of ["human", "ai"]) {
+      const c = cm.counts[gt][vt], p = cm.pct[gt][vt];
+      html += `<td style="background:${bg(p)}">${c}<br>` +
+        `<small>${p.toFixed(1)}%</small></td>`;
+    }
+    html += "</tr>";
+  }
+  return html + "</tbody></table>";
+}
+
+function podium(rows, scoreKey, scoreLabel) {
+  const top = rows.slice(0, 3);
+  if (top.length === 0) return `<p class="empty">${esc(L.lb_none)}</p>`;
+  return '<div class="podium">' + top.map((r, i) =>
+    `<div class="podium-card"><div class="podium-medal">${MEDALS[i]}</div>` +
+    `<div class="podium-rank">#${i + 1}</div>` +
+    `<div class="podium-name">${peerLink(r.peer_id)}</div>` +
+    `<div class="podium-score">${esc(r[scoreKey] == null ? "-" : r[scoreKey])}</div>` +
+    `<div class="podium-score-label">${esc(scoreLabel)}</div></div>`).join("") + "</div>";
+}
+
+function pageLeaderboard() {
+  // 'Human votes only': the SAME filter feeds the boards and the confusion matrix — Best Fooling then
+  // counts only how well the AIs fooled HUMAN judges, and Best Detecting ranks human detectors only
+  // (an all-AI-voters subset leaves nothing to rank once filtered)
+  let votes = votesInScope(STATE.scope);
+  if (STATE.humanOnly) votes = votes.filter((r) => r.v.voter_nature === "human");
+  const fooling = STATE.lb === "fooling";
+  const rows = fooling ? aggVotee(votes) : aggVoter(votes);
+  const cm = aggConfusion(votes);
+
+  const scopeBtns = Object.keys(SCOPES).map((k) =>
+    `<button class="ctrl-btn${k === STATE.scope ? " active" : ""}" ` +
+    `onclick="setScope('${k}')">${esc(L.scope_labels[k])}</button>`).join("");
+  const humanOnly = `<label class="ctrl-check"><input type="checkbox" ` +
+    `${STATE.humanOnly ? "checked" : ""} onchange="setHumanOnly(this.checked)"> ` +
+    `${esc(L.lb_human_only)}</label>`;
+  const lbBtns = [["fooling", L.lb_fooling], ["detecting", L.lb_detecting]].map(([k, lbl]) =>
+    `<button class="ctrl-btn${k === STATE.lb ? " active" : ""}" ` +
+    `onclick="setLB('${k}')">${esc(lbl)}</button>`).join("");
+
+  const columns = fooling
+    ? [{ name: "#", width: "52px" }, { name: L.votee_cols.peer, formatter: (c) => gridjs.html(peerLink(c)) },
+       L.votee_cols.votes, L.votee_cols.fooling, L.votee_cols.avg_msgs, L.votee_cols.turing]
+    : [{ name: "#", width: "52px" }, { name: L.voter_cols.peer, formatter: (c) => gridjs.html(peerLink(c)) },
+       L.voter_cols.nature, L.voter_cols.votes, L.voter_cols.precision, L.voter_cols.recall,
+       L.voter_cols.f1, L.voter_cols.detection];
+  // Empty (unparsable) votes never enter the scores, but the 'Votes cast' column brackets how many
+  // each voter produced, under the same scope window and human-only filter
+  const now = Date.now();
+  const emptyByVoter = new Map();
+  for (const r of DB.emptyVotes) {
+    if ((now - r.ts) > SCOPES[STATE.scope]) continue;
+    if (STATE.humanOnly && r.v.voter_nature !== "human") continue;
+    if (r.v.voter) emptyByVoter.set(r.v.voter, (emptyByVoter.get(r.v.voter) || 0) + 1);
+  }
+  const data = rows.slice(0, 100).map((r, i) => fooling
+    ? [i + 1, r.peer_id, r.votes, r.fooling_rate, r.avg_msgs, r.turing_score]
+    : [i + 1, r.peer_id, natureLabel(r.nature), fmtCast(r.votes, emptyByVoter.get(r.peer_id) || 0),
+       r.precision ?? "-", r.recall ?? "-",
+       r.f1 ?? "-", r.detection_score ?? "-"]);
+  setTimeout(() => {
+    const el = document.getElementById("lb-grid");
+    if (!el) return;
+    new gridjs.Grid({ columns, data, search: true, sort: true, pagination: { limit: 20 },
+                      language: GRID_LANG() }).render(el);
+  }, 0);
+
+  return `<h2 class="section-title">${esc(L.lb_title)}</h2>` +
+    podium(rows, fooling ? "turing_score" : "detection_score",
+           fooling ? L.lb_score_fooling : L.lb_score_detecting) +
+    `<div class="ctrl-bar">${scopeBtns}<span style="flex:1"></span>${humanOnly}${lbBtns}</div>` +
+    `<div id="lb-grid"></div>` +
+    `<div class="two-col" style="margin-top:18px"><div class="panel">` +
+    `<h3>${esc(L.cm_title)} — ${esc(L.scope_labels[STATE.scope])}</h3>${cmTable(cm)}</div><div></div></div>`;
+}
+
+window.setScope = (k) => { STATE.scope = k; route(); };
+window.setLB = (k) => { STATE.lb = k; route(); };
+window.setHumanOnly = (v) => { STATE.humanOnly = !!v; route(); };
+
+/* ─── router ───────────────────────────────────────────── */
+function applyNav(page) {
+  document.querySelectorAll(".topnav a").forEach((a) =>
+    a.classList.toggle("active", a.getAttribute("data-nav") === page));
+}
+
+async function route() {
+  const app = $("#app");
+  if (!DB.loaded) return;
+  if (DB.error) { app.innerHTML = `<div class="error-banner">${esc(DB.error)}</div>`; return; }
+  const hash = location.hash.replace(/^#\/?/, "");
+  const parts = hash.split("/");
+  const page = parts[0] || "overview";
+  applyNav(page === "room" ? "floors" : (page === "user" ? "users" : page));
+  try {
+    if (page === "overview" || page === "") { app.innerHTML = pageOverview(); drawOpsChart(); }
+    else if (page === "floors") app.innerHTML = pageFloors();
+    else if (page === "room" && parts.length >= 2) {
+      // Optional ?a=<voter>&b=<votee>&af=&bf=<their fake names>&t=<vote ts> after the session:
+      // restricts the transcript to the window the two identities shared right before that vote
+      // (the links in the vote tables carry them). URLSearchParams already decodes.
+      const [sess, query] = parts.slice(1).join("/").split("?");
+      const q = new URLSearchParams(query || "");
+      app.innerHTML = await pageRoom(unseg(sess), q.get("a"), q.get("b"),
+                                     q.get("af") || null, q.get("bf") || null,
+                                     parseInt(q.get("t") || "0", 10) || null);
+    }
+    else if (page === "users") app.innerHTML = pageUsers();
+    else if (page === "user" && parts.length >= 2) app.innerHTML = pageUser(unseg(parts.slice(1).join("/")));
+    else if (page === "leaderboard") app.innerHTML = pageLeaderboard();
+    else app.innerHTML = `<p class="empty">${esc(L.site_not_found)}</p>`;
+  } catch (e) {
+    app.innerHTML = `<div class="error-banner">${esc(fill(L.site_error_generic, { ERROR: e.message }))}</div>`;
+  }
+}
+
+window.addEventListener("hashchange", route);
+$("#app").innerHTML = `<p class="empty">${esc(L.site_loading)}</p>`;
+loadAll().then(route).catch((e) => {
+  DB.error = fill(L.site_error_api, { ERROR: e.message });
+  DB.loaded = true;
+  route();
+});
